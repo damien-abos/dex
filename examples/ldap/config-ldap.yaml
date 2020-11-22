@@ -11,12 +11,13 @@ connectors:
   name: OpenLDAP
   id: ldap
   config:
-    host: localhost:389
+    host: localhost:4389
 
     # No TLS for this setup.
     insecureNoSSL: true
 
     # This would normally be a read-only user.
+    bindOnce: false
     bindDN: cn=admin,dc=example,dc=org
     bindPW: admin
 
@@ -24,7 +25,8 @@ connectors:
 
     userSearch:
       baseDN: ou=People,dc=example,dc=org
-      filter: "(objectClass=person)"
+      filter: "(objectClass=inetOrgPerson)"
+      scope: base
       username: mail
       # "DN" (case sensitive) is a special attribute name. It indicates that
       # this value should be taken from the entity's DN not an attribute on
@@ -45,6 +47,7 @@ connectors:
 
       # The group name should be the "cn" value.
       nameAttr: cn
+      memberOfAttr: memberOf
 
 staticClients:
 - id: example-app

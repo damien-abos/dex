@@ -29,6 +29,7 @@ import (
 //       # The following field is required if using port 389.
 //       # insecureNoSSL: true
 //       rootCA: /etc/dex/ldap.ca
+//       bindOnce: true
 //       bindDN: uid=seviceaccount,cn=users,dc=example,dc=com
 //       bindPW: password
 //       userSearch:
@@ -54,6 +55,7 @@ import (
 //         - userAttr: DN
 //           groupAttr: member
 //         nameAttr: name
+//         memberOf: memberOf
 //
 
 // UserMatcher holds information about user and group matching.
@@ -90,6 +92,7 @@ type Config struct {
 
 	// BindDN and BindPW for an application service account. The connector uses these
 	// credentials to search for users and groups.
+	BindOnce bool `json:"bindOnce"` // default true
 	BindDN string `json:"bindDN"`
 	BindPW string `json:"bindPW"`
 
@@ -155,6 +158,9 @@ type Config struct {
 
 		// The attribute of the group that represents its name.
 		NameAttr string `json:"nameAttr"`
+
+		// The attribute of the user that represents its membership
+		MemberOfAttr string `json:"memberOfAttr"` // default to memberOf
 	} `json:"groupSearch"`
 }
 
@@ -175,10 +181,12 @@ func parseScope(s string) (int, bool) {
 	// NOTE(ericchiang): ScopeBaseObject doesn't really make sense for us because we
 	// never know the user's or group's DN.
 	switch s {
-	case "", "sub":
+	case "sub":
 		return ldap.ScopeWholeSubtree, true
 	case "one":
 		return ldap.ScopeSingleLevel, true
+	case "", "base":
+		return ldap.ScopeBaseObject, true
 	}
 	return 0, false
 }
@@ -211,6 +219,7 @@ func (c *Config) Open(id string, logger log.Logger) (connector.Connector, error)
 
 type refreshData struct {
 	Username string     `json:"username"`
+	Password string     `json:"password"`
 	Entry    ldap.Entry `json:"entry"`
 }
 
@@ -330,12 +339,15 @@ func (c *ldapConnector) do(_ context.Context, f func(c *ldap.Conn) error) error 
 	}
 	defer conn.Close()
 
-	// If bindDN and bindPW are empty this will default to an anonymous bind.
-	if err := conn.Bind(c.BindDN, c.BindPW); err != nil {
-		if c.BindDN == "" && c.BindPW == "" {
-			return fmt.Errorf("ldap: initial anonymous bind failed: %v", err)
+	// if BindOnce use bindDN and bindPW to connect to ldap server
+	if c.BindOnce {
+		// If bindDN and bindPW are empty this will default to an anonymous bind.
+		if err := conn.Bind(c.BindDN, c.BindPW); err != nil {
+			if c.BindDN == "" && c.BindPW == "" {
+				return fmt.Errorf("ldap: initial anonymous bind failed: %v", err)
+			}
+			return fmt.Errorf("ldap: initial bind for user %q failed: %v", c.BindDN, err)
 		}
-		return fmt.Errorf("ldap: initial bind for user %q failed: %v", c.BindDN, err)
 	}
 
 	return f(conn)
@@ -391,6 +403,7 @@ func (c *ldapConnector) identityFromEntry(user ldap.Entry) (ident connector.Iden
 	// TODO(ericchiang): Let this value be set from an attribute.
 	ident.EmailVerified = true
 
+
 	if len(missing) != 0 {
 		err := fmt.Errorf("ldap: entry %q missing following required attribute(s): %q", user.DN, missing)
 		return connector.Identity{}, err
@@ -404,15 +417,22 @@ func (c *ldapConnector) userEntry(conn *ldap.Conn, username string) (user ldap.E
 		filter = fmt.Sprintf("(&%s%s)", c.UserSearch.Filter, filter)
 	}
 
+	baseDN := c.UserSearch.BaseDN
+
+	if !c.BindOnce {
+		baseDN = c.UserSearch.Username + "=" + username + "," + c.UserSearch.BaseDN
+	}
+
 	// Initial search.
 	req := &ldap.SearchRequest{
-		BaseDN: c.UserSearch.BaseDN,
+		BaseDN: baseDN,
 		Filter: filter,
 		Scope:  c.userSearchScope,
 		// We only need to search for these specific requests.
 		Attributes: []string{
 			c.UserSearch.IDAttr,
 			c.UserSearch.EmailAttr,
+			c.GroupSearch.MemberOfAttr,
 			// TODO(ericchiang): what if this contains duplicate values?
 		},
 	}
@@ -463,6 +483,16 @@ func (c *ldapConnector) Login(ctx context.Context, s connector.Scopes, username,
 	)
 
 	err = c.do(ctx, func(conn *ldap.Conn) error {
+		// if not already connected try to connect with username, password
+		if !c.BindOnce {
+			var (
+				bindDN = c.UserSearch.Username + "=" + username + "," + c.UserSearch.BaseDN
+				bindPW = password
+			)
+			if err := conn.Bind(bindDN, bindPW); err != nil {
+				return fmt.Errorf("ldap: initial bind for user %q failed: %v", bindDN, err)
+			}
+		}
 		entry, found, err := c.userEntry(conn, username)
 		if err != nil {
 			return err
@@ -474,21 +504,23 @@ func (c *ldapConnector) Login(ctx context.Context, s connector.Scopes, username,
 		user = entry
 
 		// Try to authenticate as the distinguished name.
-		if err := conn.Bind(user.DN, password); err != nil {
-			// Detect a bad password through the LDAP error code.
-			if ldapErr, ok := err.(*ldap.Error); ok {
-				switch ldapErr.ResultCode {
-				case ldap.LDAPResultInvalidCredentials:
-					c.logger.Errorf("ldap: invalid password for user %q", user.DN)
-					incorrectPass = true
-					return nil
-				case ldap.LDAPResultConstraintViolation:
-					c.logger.Errorf("ldap: constraint violation for user %q: %s", user.DN, ldapErr.Error())
-					incorrectPass = true
-					return nil
-				}
-			} // will also catch all ldap.Error without a case statement above
-			return fmt.Errorf("ldap: failed to bind as dn %q: %v", user.DN, err)
+		if !c.BindOnce {
+			if err := conn.Bind(user.DN, password); err != nil {
+				// Detect a bad password through the LDAP error code.
+				if ldapErr, ok := err.(*ldap.Error); ok {
+					switch ldapErr.ResultCode {
+					case ldap.LDAPResultInvalidCredentials:
+						c.logger.Errorf("ldap: invalid password for user %q", user.DN)
+						incorrectPass = true
+						return nil
+					case ldap.LDAPResultConstraintViolation:
+						c.logger.Errorf("ldap: constraint violation for user %q: %s", user.DN, ldapErr.Error())
+						incorrectPass = true
+						return nil
+					}
+				} // will also catch all ldap.Error without a case statement above
+				return fmt.Errorf("ldap: failed to bind as dn %q: %v", user.DN, err)
+			}
 		}
 		return nil
 	})
@@ -514,6 +546,7 @@ func (c *ldapConnector) Login(ctx context.Context, s connector.Scopes, username,
 	if s.OfflineAccess {
 		refresh := refreshData{
 			Username: username,
+			Password: password,
 			Entry:    user,
 		}
 		// Encode entry for follow up requests such as the groups query and
@@ -534,6 +567,16 @@ func (c *ldapConnector) Refresh(ctx context.Context, s connector.Scopes, ident c
 
 	var user ldap.Entry
 	err := c.do(ctx, func(conn *ldap.Conn) error {
+		// if not already connected try to connect with username, password
+		if !c.BindOnce {
+			var (
+				bindDN = c.UserSearch.Username + "=" + data.Username + "," + c.UserSearch.BaseDN
+				bindPW = data.Password
+			)
+			if err := conn.Bind(bindDN, bindPW); err != nil {
+				return fmt.Errorf("ldap: initial bind for user %q failed: %v", bindDN, err)
+			}
+		}
 		entry, found, err := c.userEntry(conn, data.Username)
 		if err != nil {
 			return err
@@ -568,6 +611,11 @@ func (c *ldapConnector) Refresh(ctx context.Context, s connector.Scopes, ident c
 }
 
 func (c *ldapConnector) groups(ctx context.Context, user ldap.Entry) ([]string, error) {
+
+	if memberOf := getAttrs(user, c.GroupSearch.MemberOfAttr); memberOf != nil {
+		return memberOf, nil
+	}
+
 	if c.GroupSearch.BaseDN == "" {
 		c.logger.Debugf("No groups returned for %q because no groups baseDN has been configured.", getAttr(user, c.UserSearch.NameAttr))
 		return nil, nil
